@@ -1,0 +1,13 @@
+services:
+  zonedns:
+    build: .
+    image: svc-test-zonedns:local
+    ports:
+      - "8000:8000/tcp"      # operations web UI
+      - "5353:5353/udp"      # authoritative UDP DNS for svc.test.
+    volumes:
+      - zone-data:/data      # SQLite zone store survives restarts
+    restart: unless-stopped
+
+volumes:
+  zone-data:
