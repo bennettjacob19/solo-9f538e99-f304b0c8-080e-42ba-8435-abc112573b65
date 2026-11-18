@@ -95,7 +95,7 @@ def index_body(msg="", err=""):
 {version_info}
 {records_table(snap)}
 
-<h2>发起真实查询（UDP → 本机权威 DNS）</h2>
+<h2>发起真实查询（UDP → 本机权威 DNS；遇 TC 自动转 TCP 取完整结果）</h2>
 <form method="get" action="/query">
   <input type="text" name="name" placeholder="web 或 web.svc.test." required>
   <select name="qtype">
@@ -160,17 +160,29 @@ def query(name: str = "", qtype: str = "A"):
         qname = fqdn(name)
     except ValueError:
         qname = name.strip().lower().rstrip(".") + "."  # let the server REFUSE it
+    question = dnslib.DNSRecord.question(qname, qtype)
     try:
-        pkt = dnslib.DNSRecord.question(qname, qtype).send(
-            runtime.dns_query_host, runtime.dns_query_port, timeout=3
-        )
+        # 1) UDP first, exactly like a normal stub resolver
+        pkt = question.send(runtime.dns_query_host, runtime.dns_query_port, timeout=3)
         resp = dnslib.DNSRecord.parse(pkt)
+        transport = "UDP"
+        # 2) TC means the authoritative answer did not fit the declared UDP
+        #    capacity: re-ask over TCP to retrieve the complete record set.
+        if resp.header.tc:
+            pkt = question.send(
+                runtime.dns_query_host, runtime.dns_query_port, tcp=True, timeout=3
+            )
+            resp = dnslib.DNSRecord.parse(pkt)
+            transport = "UDP(TC) -> TCP"
     except Exception as exc:
         body = f"<div class='err'>查询失败: {esc(exc)}</div><p><a href='/'>返回</a></p>"
         return page(body, title="查询失败", status_code=502)
 
     rcode = dnslib.RCODE[resp.header.rcode]
-    lines = [f";; ->>HEADER<<- rcode: {rcode}, aa: {resp.header.aa}"]
+    lines = [
+        f";; ->>HEADER<<- rcode: {rcode}, aa: {resp.header.aa}, tc: {resp.header.tc}",
+        f";; transport: {transport}",
+    ]
     for rr in resp.rr:
         lines.append(f"{rr.rname} {rr.ttl} IN {dnslib.QTYPE[rr.rtype]} {rr.rdata}")
     if not resp.rr:

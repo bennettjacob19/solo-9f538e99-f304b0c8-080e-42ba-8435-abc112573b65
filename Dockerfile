@@ -14,5 +14,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 RUN mkdir -p /data
 
-EXPOSE 8000/tcp 5353/udp
+EXPOSE 8000/tcp 5353/udp 5353/tcp
 CMD ["python", "-m", "app.main"]

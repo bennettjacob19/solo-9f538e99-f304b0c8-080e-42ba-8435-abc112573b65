@@ -9,12 +9,14 @@ Covers:
   4. publish v2: new queries use the new version
   5. consistency: answers during concurrent publishes never mix versions
   6. write failure: old version keeps serving, DB untouched, recovery works
-  7. restart: committed version is reloaded, no partial data
+  7. large answers: UDP truncation with TC, EDNS size limits, TCP full set
+  8. restart: committed version is reloaded, no partial data
 
 Run with the project venv python:  /tmp/testvenv/bin/python tests/e2e_test.py
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,6 +26,7 @@ import time
 
 import dnslib
 import httpx
+from dnslib import EDNS0, QTYPE
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -50,6 +53,20 @@ def check(name, cond, detail=""):
 def dns_query(name, qtype="A"):
     pkt = dnslib.DNSRecord.question(name, qtype).send("127.0.0.1", DNS_PORT, timeout=3)
     return dnslib.DNSRecord.parse(pkt)
+
+
+def dns_query_tcp(name, qtype="A"):
+    pkt = dnslib.DNSRecord.question(name, qtype).send(
+        "127.0.0.1", DNS_PORT, tcp=True, timeout=3
+    )
+    return dnslib.DNSRecord.parse(pkt)
+
+
+def dns_query_edns(name, qtype="A", udp_len=1232):
+    q = dnslib.DNSRecord.question(name, qtype)
+    q.add_ar(EDNS0(udp_len=udp_len))
+    pkt = q.send("127.0.0.1", DNS_PORT, timeout=3)
+    return dnslib.DNSRecord.parse(pkt), pkt
 
 
 def answers_of(resp):
@@ -146,6 +163,81 @@ def test_validation():
             check(f"unit: reject {name}", True)
     ok = parse_zone_text("web A 10.0.0.1\napp CNAME web\n# comment\n\n")
     check("unit: valid zone parses", set(ok) == {"web.svc.test.", "app.svc.test."})
+
+
+def test_large_answer_truncation():
+    """UDP truncation with TC, EDNS capacity, and TCP full retrieval.
+
+    Uses a published pool.svc.test. holding 40 A records plus a CNAME chain
+    alias -> pool, app -> alias.
+    """
+    zone = "\n".join(f"pool A 10.3.{i // 256}.{i % 256} 60" for i in range(40))
+    zone += "\nalias CNAME pool\napp CNAME alias\n"
+    r = publish(zone, note="40-A pool")
+    check("trunc: publish 40-A pool -> 303", r.status_code == 303, str(r.status_code))
+
+    # 1. plain UDP, no EDNS: packet must fit 512 bytes, carry TC, still parse
+    q = dnslib.DNSRecord.question("pool.svc.test.", "A")
+    wire = q.send("127.0.0.1", DNS_PORT, timeout=3)
+    resp = dnslib.DNSRecord.parse(wire)
+    n_a = sum(1 for rr in resp.rr if QTYPE[rr.rtype] == "A")
+    check("trunc: no-EDNS UDP reply <= 512 bytes", len(wire) <= 512, f"{len(wire)} bytes")
+    check("trunc: no-EDNS UDP sets TC", resp.header.tc == 1)
+    check("trunc: truncated UDP keeps some A records", 0 < n_a < 40, f"{n_a} A records")
+    check("trunc: truncated UDP stays NOERROR/AA",
+          dnslib.RCODE[resp.header.rcode] == "NOERROR" and resp.header.aa == 1)
+
+    # 2. EDNS(0) with a generous advertised size: full answer, no TC, OPT echoed
+    resp, wire = dns_query_edns("pool.svc.test.", "A", udp_len=4096)
+    n_a = sum(1 for rr in resp.rr if QTYPE[rr.rtype] == "A")
+    has_opt = any(rr.rtype == QTYPE.OPT for rr in resp.ar)
+    check("trunc: EDNS4096 UDP returns all 40 A without TC",
+          resp.header.tc == 0 and n_a == 40, f"tc={resp.header.tc}, A={n_a}")
+    check("trunc: EDNS response echoes OPT pseudo-record", has_opt)
+    check("trunc: EDNS reply within advertised size", len(wire) <= 4096)
+
+    # 3. EDNS advertising 512 behaves like the classic limit: TC again
+    resp, wire = dns_query_edns("pool.svc.test.", "A", udp_len=512)
+    check("trunc: EDNS512 UDP still truncates with TC",
+          resp.header.tc == 1 and len(wire) <= 512, f"tc={resp.header.tc}, {len(wire)}B")
+
+    # 4. TCP returns the complete A set without TC
+    resp = dns_query_tcp("pool.svc.test.", "A")
+    n_a = sum(1 for rr in resp.rr if QTYPE[rr.rtype] == "A")
+    check("trunc: TCP returns full 40 A set, no TC",
+          resp.header.tc == 0 and n_a == 40, f"tc={resp.header.tc}, A={n_a}")
+
+    # 5. TCP returns the complete CNAME chain plus every A record
+    resp = dns_query_tcp("app.svc.test.", "A")
+    cnames = [str(rr.rdata) for rr in resp.rr if QTYPE[rr.rtype] == "CNAME"]
+    n_a = sum(1 for rr in resp.rr if QTYPE[rr.rtype] == "A")
+    check("trunc: TCP keeps full CNAME chain + 40 A",
+          cnames == ["alias.svc.test.", "pool.svc.test."] and n_a == 40,
+          f"{cnames}, A={n_a}")
+
+    # 6. truncated UDP keeps the leading CNAME chain intact (parseable, single version)
+    q = dnslib.DNSRecord.question("app.svc.test.", "A")
+    resp = dnslib.DNSRecord.parse(q.send("127.0.0.1", DNS_PORT, timeout=3))
+    cnames = [(str(rr.rname), str(rr.rdata)) for rr in resp.rr
+              if QTYPE[rr.rtype] == "CNAME"]
+    check("trunc: UDP TC keeps CNAME chain prefix",
+          resp.header.tc == 1
+          and cnames == [("app.svc.test.", "alias.svc.test."),
+                         ("alias.svc.test.", "pool.svc.test.")],
+          str(cnames))
+
+    # 7. a small answer is still served whole over UDP, no TC
+    resp = dns_query("alias.svc.test.", "CNAME")
+    check("trunc: small UDP answer is whole, no TC",
+          resp.header.tc == 0 and len(resp.rr) == 1)
+
+    # 8. web page sees TC on UDP and retries over TCP, showing all 40 results
+    page = httpx.get(WEB + "/query", params={"name": "pool", "qtype": "A"}, timeout=10)
+    shown = set(re.findall(r"10\.3\.\d+\.\d+", page.text))
+    check("trunc: web auto TCP fallback shows all 40 addresses",
+          page.status_code == 200 and len(shown) == 40, f"{len(shown)} shown")
+    check("trunc: web page reports UDP(TC) -> TCP transport",
+          "UDP(TC)" in page.text and "TCP" in page.text)
 
 
 # ------------------------------------------------------------------ e2e flow
@@ -306,6 +398,10 @@ def main():
         check("e2e: publish works again after recovery", r.status_code == 303,
               f"got {r.status_code}")
 
+        # 7b. large answers: UDP TC truncation, EDNS capacity, TCP full set,
+        #     web TCP fallback (publishes its own 40-A version on top)
+        test_large_answer_truncation()
+
         # 8. restart: committed version is reloaded; nothing partial appears
         last = httpx.get(WEB + "/api/current", timeout=5).json()
         n_versions = len(httpx.get(WEB + "/api/versions", timeout=5).json())
@@ -317,9 +413,18 @@ def main():
         cur = httpx.get(WEB + "/api/current", timeout=5).json()
         check("e2e: restart reloads last committed version",
               cur["version"] == last["version"], f"{cur['version']} != {last['version']}")
-        resp = dns_query("app.svc.test.", "A")
-        ip = [str(rr.rdata) for rr in resp.rr if dnslib.QTYPE[rr.rtype] == "A"]
-        check("e2e: restart serves reloaded version", ip == ["10.0.0.2"], str(ip))
+        resp = dns_query_tcp("app.svc.test.", "A")  # full set, no UDP truncation
+        ip = sorted(str(rr.rdata) for rr in resp.rr if dnslib.QTYPE[rr.rtype] == "A")
+        expected = sorted(
+            r["value"] for r in cur["records"]
+            if r["type"] == "A" and r["name"] == "pool.svc.test."
+        )
+        check("e2e: restart serves reloaded version (full A set over TCP)",
+              resp.header.tc == 0 and ip == expected and len(ip) == 40,
+              f"got {len(ip)} addrs, expected {len(expected)}")
+        udp_resp = dns_query("app.svc.test.", "A")
+        check("e2e: restarted UDP path still truncates oversized chain with TC",
+              udp_resp.header.tc == 1)
         check("e2e: restart leaves no partial versions",
               len(httpx.get(WEB + "/api/versions", timeout=5).json()) == n_versions)
         r = httpx.get(WEB + "/", timeout=5)

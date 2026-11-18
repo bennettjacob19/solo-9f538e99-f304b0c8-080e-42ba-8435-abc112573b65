@@ -4,7 +4,8 @@ services:
     image: svc-test-zonedns:local
     ports:
       - "8000:8000/tcp"      # operations web UI
-      - "5353:5353/udp"      # authoritative UDP DNS for svc.test.
+      - "5353:5353/udp"      # authoritative UDP DNS for svc.test. (TC on overflow)
+      - "5353:5353/tcp"      # authoritative TCP DNS for full/truncated-fallback answers
     volumes:
       - zone-data:/data      # SQLite zone store survives restarts
     restart: unless-stopped

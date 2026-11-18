@@ -70,7 +70,7 @@ def main():
     load_current_into_holder()  # restart: resume exactly the committed version
 
     start_dns_server(runtime.holder.get, dns_bind, dns_port)
-    log(f"authoritative UDP DNS for svc.test. on {dns_bind}:{dns_port}")
+    log(f"authoritative UDP+TCP DNS for svc.test. on {dns_bind}:{dns_port}")
 
     threading.Thread(target=refresh_loop, daemon=True).start()
 
